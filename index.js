@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 /**
- * create-metaplex-agent — scaffolds a fresh checkout of the Metaplex Agent
- * Template into <targetDir>/, then runs the same interactive setup as the
- * template's `pnpm setup`.
+ * create-metaplex-agent — scaffolds a fresh checkout of the Cloudflare-native
+ * Metaplex Agent Template into <targetDir>/, then runs the interactive setup
+ * (auth mode, keypair, plumber URL, RPC).
  *
- * Source of truth for the prompt logic is `scripts/setup.ts` in the template
- * repo (metaplex-foundation/metaplex-mastra-agent-template). Anything that
- * also lives in setup.ts should be kept in sync there.
+ * Source of truth for the new template is `metaplex-global/cloudflare-agents`
+ * on the `next` integration branch. This scaffolder produces a Worker project
+ * that deploys to Cloudflare via `wrangler deploy` — there is no long-running
+ * Node host. See README.md for the full self-host vs commissioned-hosting
+ * story.
  */
 
 import {
@@ -25,7 +27,7 @@ import nacl from 'tweetnacl';
 import bs58 from 'bs58';
 import tiged from 'tiged';
 
-const TEMPLATE = 'metaplex-foundation/metaplex-mastra-agent-template#main';
+const TEMPLATE = 'metaplex-global/cloudflare-agents#next';
 const BASE58_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 const args = process.argv.slice(2);

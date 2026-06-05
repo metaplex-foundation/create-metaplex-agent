@@ -1,6 +1,6 @@
 # create-metaplex-agent
 
-Scaffold a new [Metaplex Solana AI agent](https://github.com/metaplex-foundation/metaplex-mastra-agent-template).
+Scaffolds a Cloudflare-native Metaplex agent. Clones the [`metaplex-global/cloudflare-agents`](https://github.com/metaplex-global/cloudflare-agents) template (a Cloudflare Worker + Durable Object project, not a Node host) and runs an interactive setup that writes `.dev.vars` for local dev and prints the `wrangler secret put` / `wrangler deploy` next steps.
 
 ## Usage
 
