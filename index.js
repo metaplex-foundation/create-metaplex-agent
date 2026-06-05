@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 /**
- * create-metaplex-agent — scaffolds a fresh checkout of the Metaplex Agent
- * Template into <targetDir>/, then runs the same interactive setup as the
- * template's `pnpm setup`.
+ * create-metaplex-agent — scaffolds a fresh checkout of the Cloudflare-native
+ * Metaplex Agent Template into <targetDir>/, then runs the interactive setup
+ * (auth mode, keypair, plumber URL, RPC).
  *
- * Source of truth for the prompt logic is `scripts/setup.ts` in the template
- * repo (metaplex-foundation/metaplex-mastra-agent-template). Anything that
- * also lives in setup.ts should be kept in sync there.
+ * Source of truth for the new template is `metaplex-global/cloudflare-agents`
+ * on the `next` integration branch. This scaffolder produces a Worker project
+ * that deploys to Cloudflare via `wrangler deploy` — there is no long-running
+ * Node host. See README.md for the full self-host vs commissioned-hosting
+ * story.
  */
 
 import {
@@ -25,7 +27,7 @@ import nacl from 'tweetnacl';
 import bs58 from 'bs58';
 import tiged from 'tiged';
 
-const TEMPLATE = 'metaplex-foundation/metaplex-mastra-agent-template#main';
+const TEMPLATE = 'metaplex-global/cloudflare-agents#next';
 const BASE58_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 const args = process.argv.slice(2);
@@ -256,23 +258,30 @@ async function main() {
   // stdin stream, so we wait until they're done before reading.
   await ensureInputReady();
 
-  console.log('\nMetaplex Agent Template — interactive setup');
+  console.log('\nMetaplex Agent Template (Cloudflare-native) — interactive setup');
 
-  // 2. Mode
-  console.log('\n1. Agent mode\n');
-  console.log('  public     — end users sign their own transactions (chatbot, mint helper, etc.)');
-  console.log('  autonomous — agent signs everything itself (treasury bot, scheduled job, etc.)\n');
-  let mode = null;
-  while (mode === null) {
-    const raw = (await ask('AGENT_MODE', 'public')).toLowerCase();
-    if (raw === 'public' || raw === 'autonomous') {
-      mode = raw;
+  // 1. Auth mode
+  // The agent's Worker handshakes inbound connections one of three ways. This
+  // is the most consequential install-time choice because it determines what
+  // secrets the operator has to set and which wallets can connect at all.
+  console.log('\n1. How will users authenticate?\n');
+  console.log('  1) managed — JWT issued by Metaplex.com or another managed issuer (default, recommended)');
+  console.log('  2) siws    — direct SIWS handshake; any wallet that signs the challenge can chat');
+  console.log('  3) open    — no auth, anyone can connect (dev only — logs a warning banner)\n');
+  const AUTH_MODES = { '1': 'managed', '2': 'siws', '3': 'open' };
+  let authMode = null;
+  while (authMode === null) {
+    const raw = (await ask('Pick AUTH_MODE [1-3]', '1')).trim();
+    if (raw in AUTH_MODES) {
+      authMode = AUTH_MODES[raw];
+    } else if (raw === 'managed' || raw === 'siws' || raw === 'open') {
+      authMode = raw;
     } else {
-      console.log(`  "${raw}" is not a valid mode. Pick "public" or "autonomous".`);
+      console.log(`  "${raw}" is not a valid choice. Enter 1, 2, or 3.`);
     }
   }
 
-  // 3. Keypair
+  // 2. Keypair
   console.log('\n2. Agent keypair\n');
   console.log("  This is the agent's on-chain identity. The setup script will generate a fresh");
   console.log("  Ed25519 keypair so you don't need solana-keygen installed. Treat the generated");
@@ -308,52 +317,57 @@ async function main() {
     }
   }
 
-  // 4. LLM provider + key
-  console.log('\n3. LLM provider\n');
-  console.log('  1) Anthropic (default)');
-  console.log('  2) OpenAI');
-  console.log('  3) Google\n');
-  const PROVIDERS = {
-    '1': { key: 'ANTHROPIC_API_KEY', model: 'anthropic/claude-sonnet-4-5-20250929' },
-    '2': { key: 'OPENAI_API_KEY', model: 'openai/gpt-4o' },
-    '3': { key: 'GOOGLE_GENERATIVE_AI_API_KEY', model: 'google/gemini-2.5-pro' },
-  };
-  let provider = null;
-  while (provider === null) {
-    const raw = (await ask('Pick provider [1-3]', '1')).trim();
-    if (raw in PROVIDERS) {
-      provider = PROVIDERS[raw];
-    } else {
-      console.log(`  "${raw}" is not a valid choice. Enter 1, 2, or 3.`);
+  // 3. Plumber URL — BYOK-free LLM + RPC. Blank = self-host with direct
+  // provider keys, set after deploy via `wrangler secret put ANTHROPIC_API_KEY`.
+  console.log('\n3. Plumber URL (optional)\n');
+  console.log('  Agent-plumber resells LLM inference + Solana RPC behind x402 v2 so');
+  console.log("  you don't need to provision provider keys or a paid RPC upfront.");
+  console.log('  Leave blank to skip — the Worker falls back to direct provider keys');
+  console.log('  (set ANTHROPIC_API_KEY via `wrangler secret put` after deploy).\n');
+  let plumberUrl = '';
+  while (true) {
+    const raw = (await ask('PLUMBER_URL (blank to skip for BYOK)', '')).trim();
+    if (raw === '') break;
+    try {
+      const u = new URL(raw);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+        console.log('  PLUMBER_URL must be http(s).');
+        continue;
+      }
+      plumberUrl = raw.replace(/\/+$/, '');
+      break;
+    } catch {
+      console.log('  Not a valid URL. Try again or leave blank.');
     }
   }
-  const providerKey = provider.key;
-  const llmModel = provider.model;
-  // Hidden input: pasted API keys must not echo to the terminal so they
-  // don't end up in screen recordings or scrollback.
-  const llmKey = await askSecret(`Paste ${providerKey} (input hidden — leave blank to fill later)`);
 
-  // 5. Solana RPC
+  // 4. Solana RPC — only matters when PLUMBER_URL is blank. With plumber set,
+  // the Worker routes all umi.rpc.* calls through plumber's /v1/solana/rpc and
+  // SOLANA_RPC_HTTP is ignored. We still ask so the operator has a sensible
+  // default to fall back to if they later unset PLUMBER_URL.
   console.log('\n4. Solana RPC\n');
+  if (plumberUrl) {
+    console.log('  PLUMBER_URL is set, so the Worker routes RPC through plumber.');
+    console.log('  The value below is only used if you later unset PLUMBER_URL.\n');
+  } else {
+    console.log('  Used directly when PLUMBER_URL is blank.\n');
+  }
   console.log('  1) devnet     — https://api.devnet.solana.com (default; free public RPC)');
   console.log('  2) mainnet    — https://api.mainnet-beta.solana.com (free public RPC, rate-limited)');
-  console.log('  3) localnet   — http://localhost:8899 (your local solana-test-validator)');
-  console.log('  4) custom     — paste a URL (e.g. Helius/QuickNode/Triton)\n');
+  console.log('  3) custom     — paste a URL (e.g. Helius/QuickNode/Triton)\n');
   const RPC_PRESETS = {
-    '1': { url: 'https://api.devnet.solana.com', preset: 'devnet', cluster: 'devnet' },
-    '2': { url: 'https://api.mainnet-beta.solana.com', preset: 'mainnet', cluster: 'mainnet-beta' },
-    '3': { url: 'http://localhost:8899', preset: 'localnet', cluster: 'devnet' },
+    '1': { url: 'https://api.devnet.solana.com', cluster: 'devnet' },
+    '2': { url: 'https://api.mainnet-beta.solana.com', cluster: 'mainnet-beta' },
   };
   let rpcUrl;
-  let rpcPreset;
   let rpcCluster;
   while (true) {
-    const raw = (await ask('Pick RPC [1-4]', '1')).trim();
+    const raw = (await ask('Pick RPC [1-3]', '1')).trim();
     if (raw in RPC_PRESETS) {
-      ({ url: rpcUrl, preset: rpcPreset, cluster: rpcCluster } = RPC_PRESETS[raw]);
+      ({ url: rpcUrl, cluster: rpcCluster } = RPC_PRESETS[raw]);
       break;
     }
-    if (raw === '4') {
+    if (raw === '3') {
       while (true) {
         const custom = (await ask('Custom RPC URL')).trim();
         try {
@@ -363,15 +377,12 @@ async function main() {
             continue;
           }
           rpcUrl = custom;
-          rpcPreset = 'custom';
           break;
         } catch {
           console.log('  Not a valid URL. Try again.');
         }
       }
       while (true) {
-        // Cluster is needed independently of URL because SIWS chain-id
-        // verification can't infer the network from a private RPC hostname.
         const c = (await ask('Cluster [mainnet-beta/devnet/testnet]', 'devnet'))
           .trim()
           .toLowerCase();
@@ -383,142 +394,65 @@ async function main() {
       }
       break;
     }
-    console.log(`  "${raw}" is not a valid choice. Enter 1, 2, 3, or 4.`);
+    console.log(`  "${raw}" is not a valid choice. Enter 1, 2, or 3.`);
   }
 
-  // 6. Wallet allowlist (public mode) or bootstrap wallet (autonomous mode)
+  // 5. Owner wallet + allowlist — only meaningful in siws mode.
+  // managed mode trusts the JWT issuer for identity; open mode trusts no one.
+  let ownerWallet = '';
   let walletAllowlist = '';
-  let bootstrapWallet = '';
-  if (mode === 'public') {
-    console.log('\n5. Your wallet pubkey (optional)\n');
-    console.log('  Used for two things in public mode:');
-    console.log('  - WALLET_ALLOWLIST: only this wallet (plus the on-chain owner) can connect');
-    console.log('  - BOOTSTRAP_WALLET: this wallet is treated as the owner BEFORE the agent');
-    console.log('    is registered on-chain, which is what lets you call register-agent the');
-    console.log('    first time. After registration, the on-chain asset owner takes over.\n');
-    console.log('  Leave blank to skip both — the agent will accept any wallet, but no one');
-    console.log('  will be able to register it until you set BOOTSTRAP_WALLET in .env yourself.\n');
+  if (authMode === 'siws') {
+    console.log('\n5. SIWS owner + allowlist\n');
+    console.log('  AGENT_OWNER_WALLET — your wallet pubkey; treated as the agent owner');
+    console.log('  before on-chain registration. After registration the Core asset owner');
+    console.log('  takes over.\n');
     while (true) {
-      const pk = (await ask('Your wallet pubkey (or blank to skip)')).trim();
-      if (pk === '') break;
-      if (!isValidPubkey(pk)) {
-        console.log('  Not a valid base58 32-byte pubkey. Try again or leave blank.');
-        continue;
-      }
-      walletAllowlist = pk;
-      bootstrapWallet = pk;
-      break;
-    }
-  } else {
-    console.log('\n5. Bootstrap wallet (autonomous mode)\n');
-    console.log('  Autonomous mode requires a BOOTSTRAP_WALLET pubkey before the agent is');
-    console.log('  registered on-chain. After registration, the on-chain asset owner takes over.\n');
-    while (true) {
-      const pk = (await ask('BOOTSTRAP_WALLET pubkey (your wallet)')).trim();
+      const pk = (await ask('AGENT_OWNER_WALLET pubkey')).trim();
       if (!isValidPubkey(pk)) {
         console.log('  Not a valid base58 32-byte pubkey. Try again.');
         continue;
       }
-      bootstrapWallet = pk;
+      ownerWallet = pk;
       break;
     }
-  }
-
-  // 7. Persona preset — mirrors `pnpm setup` section 5 in the template.
-  console.log('\n6. Agent persona (system-prompt preset)\n');
-  console.log("  Picks the agent's domain identity. Bundled options:");
-  console.log('    1) default                  — general-purpose Solana agent');
-  console.log('    2) token-launch-concierge   — walks users through launching a token');
-  console.log('    3) wallet-cleanup-bot       — finds and sweeps dust');
-  console.log('    4) treasury-rebalancer      — autonomous treasury management');
-  console.log('  See packages/core/src/personas/ for the full prompts.\n');
-  const PERSONA_CHOICES = {
-    '1': 'default',
-    '2': 'token-launch-concierge',
-    '3': 'wallet-cleanup-bot',
-    '4': 'treasury-rebalancer',
-  };
-  let agentPersona = 'default';
-  while (true) {
-    const raw = (await ask('Pick persona [1-4]', '1')).trim();
-    if (raw in PERSONA_CHOICES) {
-      agentPersona = PERSONA_CHOICES[raw];
-      break;
-    }
-    console.log(`  "${raw}" is not a valid choice. Enter 1-4.`);
-  }
-
-  // 8. Tool categories — writes an optional agent.config.yaml overlay.
-  // Source of truth for valid category slugs is
-  // packages/shared/src/agent-config.ts (TOOLS_SCHEMA) plus the catalog
-  // in @metaplex-foundation/agent-tools. We mirror the list documented
-  // in agent.config.yaml.example. Keep in sync if the template adds
-  // a new category.
-  const TOOL_CATEGORIES = [
-    ['read', 'balance/metadata/price lookups (safe, no signing)'],
-    ['trade', 'Jupiter swaps, sell-token, buyback'],
-    ['transfer', 'SOL/token transfers between wallets'],
-    ['registration', 'register-agent, launch-token'],
-    ['treasury', 'fund-agent, withdraw-sol'],
-    ['autonomous-only', 'goals/tasks, set-paused, sleep, delegate-execution'],
-  ];
-  const VALID_CATEGORY_NAMES = new Set(TOOL_CATEGORIES.map(([n]) => n));
-  console.log('\n7. Agent tools (optional)\n');
-  console.log('  By default the agent loads the standard bundle for its mode:');
-  console.log('    public mode     → read + trade + transfer + registration');
-  console.log('    autonomous mode → everything in public + treasury + autonomous-only\n');
-  console.log('  Customize to restrict the tool set. Per-tool include/exclude');
-  console.log('  can be edited directly in agent.config.yaml after setup.\n');
-  console.log('  1) keep mode default (recommended)');
-  console.log('  2) customize by category\n');
-  let toolCategories = null;
-  while (true) {
-    const raw = (await ask('Pick [1-2]', '1')).trim();
-    if (raw === '1' || raw === '') break;
-    if (raw === '2') {
-      console.log('\n  Available categories:');
-      for (const [name, desc] of TOOL_CATEGORIES) {
-        console.log(`    ${name.padEnd(16)}— ${desc}`);
+    console.log('\n  AGENT_ALLOWLIST_WALLETS — comma-separated pubkeys allowed to chat.');
+    console.log('  Leave blank to accept any wallet that completes the SIWS handshake.\n');
+    while (true) {
+      const raw = (await ask('AGENT_ALLOWLIST_WALLETS (blank for open)', '')).trim();
+      if (raw === '') break;
+      const pks = raw.split(',').map((s) => s.trim()).filter(Boolean);
+      const bad = pks.filter((p) => !isValidPubkey(p));
+      if (bad.length > 0) {
+        console.log(`  Invalid pubkey(s): ${bad.join(', ')}. Try again or leave blank.`);
+        continue;
       }
-      console.log('\n  Enter one or more, comma-separated. e.g. "read,trade"');
-      while (true) {
-        const csv = (await ask('Categories')).trim();
-        if (csv === '') {
-          console.log('  Empty — keeping mode default.');
-          break;
-        }
-        const picks = csv
-          .split(',')
-          .map((s) => s.trim().toLowerCase())
-          .filter(Boolean);
-        const unknown = picks.filter((p) => !VALID_CATEGORY_NAMES.has(p));
-        if (unknown.length > 0) {
-          console.log(
-            `  Unknown categor${unknown.length === 1 ? 'y' : 'ies'}: ${unknown.join(', ')}. ` +
-              `Valid: ${[...VALID_CATEGORY_NAMES].join(', ')}.`,
-          );
-          continue;
-        }
-        // De-dup while preserving order so the generated yaml mirrors what
-        // the operator typed.
-        toolCategories = [...new Set(picks)];
-        break;
-      }
+      walletAllowlist = pks.join(',');
       break;
     }
-    console.log(`  "${raw}" is not a valid choice. Enter 1 or 2.`);
+  } else if (authMode === 'open') {
+    console.log('\n5. Auth mode is `open` — skipping owner/allowlist prompts.');
+    console.log('  Anyone can connect. Use this for local dev only.');
+  } else {
+    console.log('\n5. Auth mode is `managed` — skipping owner/allowlist prompts.');
+    console.log('  Identity comes from the managed-auth JWT issuer (e.g. Metaplex.com).');
   }
 
   if (rl) rl.close();
 
-  // 8. Render .env
-  const envPath = resolve(targetDir, '.env');
-  const examplePath = resolve(targetDir, '.env.example');
-  let envContent = existsSync(examplePath) ? readFileSync(examplePath, 'utf8') : '';
+  // 6. Render .dev.vars (Cloudflare convention for local-dev secrets).
+  // Wrangler's `wrangler dev` picks this up automatically and exposes the
+  // values via the same `env` binding the Worker reads in production. We
+  // chmod 0600 because it contains the agent's secret key.
+  const devVarsPath = resolve(targetDir, '.dev.vars');
+  const examplePath = resolve(targetDir, '.dev.vars.example');
+  const fallbackExamplePath = resolve(targetDir, '.env.example');
+  let envContent = '';
+  if (existsSync(examplePath)) {
+    envContent = readFileSync(examplePath, 'utf8');
+  } else if (existsSync(fallbackExamplePath)) {
+    envContent = readFileSync(fallbackExamplePath, 'utf8');
+  }
 
-  // replaceOrAppend: if the canonical key exists in .env.example, swap the
-  // line in place; otherwise append at the bottom so a customised
-  // .env.example doesn't silently drop a key we care about.
   const appended = [];
   function replaceOrAppend(re, line) {
     if (re.test(envContent)) {
@@ -528,163 +462,58 @@ async function main() {
     }
   }
 
-  replaceOrAppend(/^AGENT_MODE=.*$/m, `AGENT_MODE=${mode}`);
+  replaceOrAppend(/^AUTH_MODE=.*$/m, `AUTH_MODE=${authMode}`);
   replaceOrAppend(/^AGENT_KEYPAIR=.*$/m, `AGENT_KEYPAIR=${agentKeypair}`);
+  replaceOrAppend(/^SOLANA_RPC_HTTP=.*$/m, `SOLANA_RPC_HTTP=${rpcUrl}`);
+  replaceOrAppend(/^SOLANA_CLUSTER=.*$/m, `SOLANA_CLUSTER=${rpcCluster}`);
   replaceOrAppend(
-    /^# ?ANTHROPIC_API_KEY=.*$/m,
-    `${providerKey === 'ANTHROPIC_API_KEY' ? '' : '# '}ANTHROPIC_API_KEY=${providerKey === 'ANTHROPIC_API_KEY' ? llmKey : ''}`,
+    /^# ?PLUMBER_URL=.*$/m,
+    plumberUrl ? `PLUMBER_URL=${plumberUrl}` : '# PLUMBER_URL=',
   );
-  replaceOrAppend(
-    /^# ?OPENAI_API_KEY=.*$/m,
-    `${providerKey === 'OPENAI_API_KEY' ? '' : '# '}OPENAI_API_KEY=${providerKey === 'OPENAI_API_KEY' ? llmKey : ''}`,
-  );
-  replaceOrAppend(
-    /^# ?GOOGLE_GENERATIVE_AI_API_KEY=.*$/m,
-    `${providerKey === 'GOOGLE_GENERATIVE_AI_API_KEY' ? '' : '# '}GOOGLE_GENERATIVE_AI_API_KEY=${providerKey === 'GOOGLE_GENERATIVE_AI_API_KEY' ? llmKey : ''}`,
-  );
-  replaceOrAppend(/^SOLANA_RPC_URL=.*$/m, `SOLANA_RPC_URL=${rpcUrl}`);
-  replaceOrAppend(/^WALLET_ALLOWLIST=.*$/m, `WALLET_ALLOWLIST=${walletAllowlist}`);
-  replaceOrAppend(
-    /^# ?BOOTSTRAP_WALLET=.*$/m,
-    bootstrapWallet ? `BOOTSTRAP_WALLET=${bootstrapWallet}` : '# BOOTSTRAP_WALLET=',
-  );
-  // AGENT_PERSONA — only emit a non-comment line when the operator picked
-  // a non-default persona, so a freshly-set-up .env stays minimal. The regex
-  // matches the placeholder whether it's commented (`# AGENT_PERSONA=`) or
-  // uncommented (`AGENT_PERSONA=`) so a template that promotes this key from
-  // optional to default doesn't cause a duplicate line to be appended.
-  replaceOrAppend(
-    /^#? ?AGENT_PERSONA=.*$/m,
-    agentPersona === 'default' ? '# AGENT_PERSONA=default' : `AGENT_PERSONA=${agentPersona}`,
-  );
-
-  // LLM_MODEL is optional in the slim example (defaults to Anthropic Claude).
-  // Only write a line when the operator picked a non-default provider.
-  if (llmModel !== 'anthropic/claude-sonnet-4-5-20250929') {
-    if (/^LLM_MODEL=/m.test(envContent)) {
-      envContent = envContent.replace(/^LLM_MODEL=.*$/m, `LLM_MODEL=${llmModel}`);
-    } else {
-      appended.push(`LLM_MODEL=${llmModel}`);
-    }
-  }
-
-  if (appended.length > 0) {
-    if (!envContent.endsWith('\n')) envContent += '\n';
-    envContent += '\n# --- appended by `create-metaplex-agent` (key not found in .env.example) ---\n';
-    envContent += appended.join('\n') + '\n';
-  }
-
-  // Atomic write: temp file in the same directory, then rename. If we get
-  // SIGINT'd between the write and the rename we leave at most a tmp file
-  // (which the SIGINT handler unlinks) — never a half-written .env.
-  const tmpPath = `${envPath}.tmp`;
-  tmpEnvPath = tmpPath;
-  writeFileSync(tmpPath, envContent, { mode: 0o600 });
-  // writeFileSync's `mode` only applies on creation, not overwrite, so force
-  // 0600 explicitly. Same on the final path after rename.
-  chmodSync(tmpPath, 0o600);
-  renameSync(tmpPath, envPath);
-  chmodSync(envPath, 0o600);
-  tmpEnvPath = null;
-  console.log(`\n  wrote ${envPath} (chmod 0600)`);
-  if (appended.length > 0) {
-    console.log(
-      `  (${appended.length} key${appended.length === 1 ? '' : 's'} appended because .env.example was missing the placeholder line)`,
+  if (authMode === 'siws') {
+    replaceOrAppend(/^# ?AGENT_OWNER_WALLET=.*$/m, `AGENT_OWNER_WALLET=${ownerWallet}`);
+    replaceOrAppend(
+      /^# ?AGENT_ALLOWLIST_WALLETS=.*$/m,
+      walletAllowlist
+        ? `AGENT_ALLOWLIST_WALLETS=${walletAllowlist}`
+        : '# AGENT_ALLOWLIST_WALLETS=',
     );
   }
 
-  // Render agent.config.yaml when the operator picked a category overlay.
-  // Skipped when toolCategories is null (mode default) — the template ships
-  // agent.config.yaml.example separately, so the operator can still copy and
-  // edit it later if they want the full overlay surface.
-  if (toolCategories && toolCategories.length > 0) {
-    const yamlPath = resolve(targetDir, 'agent.config.yaml');
-    if (existsSync(yamlPath)) {
-      console.log(
-        `\n  ${yamlPath} already exists — leaving it unchanged. ` +
-          `Merge in: tools.include = [${toolCategories.map((c) => `'category:${c}'`).join(', ')}]`,
-      );
-    } else {
-      const yamlBody =
-        '# Generated by create-metaplex-agent. See agent.config.yaml.example\n' +
-        '# in this directory for the full set of overlay options.\n' +
-        'tools:\n' +
-        '  include:\n' +
-        toolCategories.map((c) => `    - category:${c}\n`).join('');
-      const tmpYaml = `${yamlPath}.tmp`;
-      tmpYamlPath = tmpYaml;
-      writeFileSync(tmpYaml, yamlBody);
-      renameSync(tmpYaml, yamlPath);
-      tmpYamlPath = null;
-      console.log(`  wrote ${yamlPath}`);
-    }
+  if (appended.length > 0) {
+    if (envContent && !envContent.endsWith('\n')) envContent += '\n';
+    envContent += '\n# --- appended by `create-metaplex-agent` (key not in example) ---\n';
+    envContent += appended.join('\n') + '\n';
   }
 
-  // 7. wallets.allowlist.json
-  if (mode === 'public' && walletAllowlist) {
-    const allowlistPath = resolve(targetDir, 'wallets.allowlist.json');
-    let seedAllowlist = !existsSync(allowlistPath);
-    if (!seedAllowlist) {
-      // We've already closed the main readline interface above. Open a fresh
-      // one for this final confirmation in TTY mode; in piped mode, fall back
-      // to the queue.
-      let answer;
-      if (input.isTTY) {
-        const confirmRl = createInterface({ input, output });
-        answer = (
-          await confirmRl.question(
-            `  ${allowlistPath} already exists — overwrite with [{ "wallets": ["${walletAllowlist}"] }]? [y/N]: `,
-          )
-        )
-          .trim()
-          .toLowerCase();
-        confirmRl.close();
-      } else {
-        output.write(
-          `  ${allowlistPath} already exists — overwrite with [{ "wallets": ["${walletAllowlist}"] }]? [y/N]: `,
-        );
-        answer = nextPipedLine().trim().toLowerCase();
-        output.write(`${answer}\n`);
-      }
-      seedAllowlist = answer === 'y' || answer === 'yes';
-    }
-    if (seedAllowlist) {
-      writeFileSync(
-        allowlistPath,
-        JSON.stringify({ wallets: [walletAllowlist] }, null, 2) + '\n',
-      );
-      console.log(`  wrote ${allowlistPath}`);
-    } else {
-      console.log(`  kept existing ${allowlistPath} unchanged`);
-    }
+  const tmpPath = `${devVarsPath}.tmp`;
+  tmpEnvPath = tmpPath;
+  writeFileSync(tmpPath, envContent, { mode: 0o600 });
+  chmodSync(tmpPath, 0o600);
+  renameSync(tmpPath, devVarsPath);
+  chmodSync(devVarsPath, 0o600);
+  tmpEnvPath = null;
+  console.log(`\n  wrote ${devVarsPath} (chmod 0600)`);
+  if (appended.length > 0) {
+    console.log(
+      `  (${appended.length} key${appended.length === 1 ? '' : 's'} appended because .dev.vars.example was missing the placeholder line)`,
+    );
   }
 
-  // Build a chat-template share link that pre-fills the agent profile, so
-  // operators (and anyone they hand the link to) can skip the chat UI's
-  // profile-setup step. Format mirrors `encodeProfileToHash` in
-  // metaplex-agent-chat-template/src/lib/share-link.ts — keep them in sync.
-  // Defaults assume the standard `pnpm dev:full` ports (UI 3001, WS 3002)
-  // and the .env.example default of devnet RPC.
-  const shareParams = new URLSearchParams();
-  shareParams.set('ws', 'ws://localhost:3002');
-  shareParams.set('preset', rpcPreset);
-  if (rpcPreset === 'custom') {
-    shareParams.set('rpc', rpcUrl);
-    shareParams.set('cluster', rpcCluster);
-  }
-  shareParams.set('name', dirName);
-  const shareLink = `http://localhost:3001/#${shareParams.toString()}`;
-
+  // 7. Print Cloudflare-flavored next steps. The secrets listed here mirror
+  // the production deploy path — `wrangler secret put` rather than writing
+  // them into wrangler.jsonc, which would commit them to git.
   console.log('\nDone! Next steps:\n');
-  console.log(`  cd ${dirName}`);
-  console.log('  pnpm install');
-  console.log('  pnpm doctor');
-  console.log('  pnpm dev:full');
-  console.log(
-    `\n  Then connect a wallet at http://localhost:3001 (${mode === 'public' ? 'must be on the allowlist' : 'must be the bootstrap wallet pre-registration'}).`,
-  );
-  console.log('\n  Share this link to skip profile setup in the chat UI:');
-  console.log(`    ${shareLink}`);
+  console.log(`  1. cd ${dirName}`);
+  console.log('  2. pnpm install');
+  if (authMode === 'managed') {
+    console.log('  3. wrangler secret put MANAGED_JWT_KEYS    # JWT issuer key(s), comma-separated for rotation');
+  }
+  console.log(`  ${authMode === 'managed' ? '4' : '3'}. wrangler secret put GENESIS_HMAC_KEY    # if commissioning via Metaplex.com (skip for pure self-host)`);
+  console.log(`  ${authMode === 'managed' ? '5' : '4'}. wrangler secret put AGENT_KEYPAIR       # production keypair (different from .dev.vars)`);
+  console.log(`  ${authMode === 'managed' ? '6' : '5'}. wrangler deploy`);
+  console.log(`\n  Agent pubkey: ${agentPubkey}`);
+  console.log(`  Local dev:    wrangler dev    (reads .dev.vars; opens on http://localhost:8787)`);
   console.log();
 }
 
